@@ -1,13 +1,20 @@
 # main.py
 from fastapi import FastAPI, HTTPException, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, validator, EmailStr
 import re
 import spacy
 from typing import List, Optional, Dict, Any
 import logging
 import os
+import asyncio
+from datetime import datetime
 from functools import lru_cache
+from email_valid import EmailValidator
+
+email_validator = EmailValidator()
+
+
 
 # Configure logging
 logging.basicConfig(
@@ -57,6 +64,36 @@ class ContentResponse(BaseModel):
     extracted_hashtags: List[str]
     job_title: Optional[str] = None
     stats: Dict[str, Any]
+
+# Email validation models
+class EmailValidationRequest(BaseModel):
+    email: EmailStr
+    check_smtp: bool = False
+    timeout: int = 10
+
+class ValidationResponse(BaseModel):
+    email: str
+    is_valid: bool
+    domain_exists: bool
+    mx_records: List[str] = []
+    errors: List[str] = []
+    warnings: List[str] = []
+    suggestions: List[str] = []
+    smtp_valid: Optional[bool] = None
+    validation_time: float
+    timestamp: str
+
+class BulkEmailRequest(BaseModel):
+    emails: List[EmailStr]
+    check_smtp: bool = False
+    timeout: int = 10
+
+class BulkValidationResponse(BaseModel):
+    total: int
+    valid: int
+    invalid: int
+    processing_time: float
+    results: List[ValidationResponse]
 
 # Dependency for NLP model
 def get_nlp():
@@ -136,7 +173,6 @@ def extract_job_title(content, nlp):
     pattern matching, and contextual analysis.
     """
     # Enhanced list of job title keywords
-# Enhanced list of job title keywords
     job_title_keywords = [
         # Engineering & Development
         "engineer", "developer", "architect", "programmer", "coder", "devops", 
@@ -282,7 +318,6 @@ def extract_job_title(content, nlp):
                 return ent.text
     
     # Method 3: Use patterns to find common job title formats
-# Method 3: Use patterns to find common job title formats
     patterns = [
         # QA/Testing patterns
         r'(?:qa|quality|test|testing)\s+(?:engineer|analyst|specialist|lead|manager|director|automation|manual|performance)(?:\s+\([^)]+\))?',
@@ -447,6 +482,139 @@ async def root():
 async def health_check():
     """Health check endpoint."""
     return {"status": "healthy", "version": "1.1.0"}
+
+@app.post("/validate", response_model=ValidationResponse)
+async def validate_email(request: EmailValidationRequest):
+    """
+    Validate a single email address
+    
+    - **email**: Email address to validate
+    - **check_smtp**: Whether to perform SMTP validation (slower but more thorough)
+    - **timeout**: Timeout in seconds for DNS and SMTP checks
+    """
+    start_time = asyncio.get_event_loop().time()
+    
+    try:
+        result = await email_validator.validate_email(
+            request.email, 
+            request.check_smtp, 
+            request.timeout
+        )
+        
+        processing_time = asyncio.get_event_loop().time() - start_time
+        suggestions = email_validator.get_suggestions(request.email)
+        
+        return ValidationResponse(
+            email=result.email,
+            is_valid=result.is_valid,
+            domain_exists=result.domain_exists,
+            mx_records=result.mx_records,
+            errors=result.errors,
+            warnings=result.warnings,
+            suggestions=suggestions,
+            smtp_valid=result.smtp_valid,
+            validation_time=round(processing_time, 3),
+            timestamp=datetime.now().isoformat()
+        )
+    
+    except Exception as e:
+        logger.error(f"Validation error for {request.email}: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Validation failed: {str(e)}")
+
+@app.post("/validate/bulk", response_model=BulkValidationResponse)
+async def validate_bulk_emails(request: BulkEmailRequest):
+    """
+    Validate multiple email addresses
+    
+    - **emails**: List of email addresses to validate
+    - **check_smtp**: Whether to perform SMTP validation
+    - **timeout**: Timeout in seconds for each validation
+    """
+    if len(request.emails) > 100:
+        raise HTTPException(status_code=400, detail="Maximum 100 emails allowed per request")
+    
+    start_time = asyncio.get_event_loop().time()
+    
+    try:
+        # Process emails concurrently
+        tasks = [
+            email_validator.validate_email(email, request.check_smtp, request.timeout)
+            for email in request.emails
+        ]
+        
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        responses = []
+        valid_count = 0
+        
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                # Handle individual failures
+                response = ValidationResponse(
+                    email=request.emails[i],
+                    is_valid=False,
+                    domain_exists=False,
+                    mx_records=[],
+                    errors=[f"Validation failed: {str(result)}"],
+                    warnings=[],
+                    suggestions=[],
+                    validation_time=0,
+                    timestamp=datetime.now().isoformat()
+                )
+            else:
+                if result.is_valid:
+                    valid_count += 1
+                
+                suggestions = email_validator.get_suggestions(result.email)
+                response = ValidationResponse(
+                    email=result.email,
+                    is_valid=result.is_valid,
+                    domain_exists=result.domain_exists,
+                    mx_records=result.mx_records,
+                    errors=result.errors,
+                    warnings=result.warnings,
+                    suggestions=suggestions,
+                    smtp_valid=result.smtp_valid,
+                    validation_time=0,  # Individual timing not tracked in bulk
+                    timestamp=datetime.now().isoformat()
+                )
+            
+            responses.append(response)
+        
+        processing_time = asyncio.get_event_loop().time() - start_time
+        
+        return BulkValidationResponse(
+            total=len(request.emails),
+            valid=valid_count,
+            invalid=len(request.emails) - valid_count,
+            processing_time=round(processing_time, 3),
+            results=responses
+        )
+    
+    except Exception as e:
+        logger.error(f"Bulk validation error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Bulk validation failed: {str(e)}")
+
+@app.get("/validate/{email}")
+async def quick_validate(email: str):
+    """
+    Quick email validation (GET request for simple checks)
+    Only performs format and DNS validation, no SMTP
+    """
+    try:
+        result = await email_validator.validate_email(email, check_smtp=False, timeout=5)
+        suggestions = email_validator.get_suggestions(email)
+        
+        return {
+            "email": result.email,
+            "is_valid": result.is_valid,
+            "domain_exists": result.domain_exists,
+            "errors": result.errors,
+            "suggestions": suggestions
+        }
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Validation failed: {str(e)}")
 
 # For local testing
 if __name__ == "__main__":
